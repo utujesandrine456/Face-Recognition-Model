@@ -1,0 +1,27 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE and Editor files
+.history/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Large binary files & models (>100MB will fail GitHub push)
+buffalo_l.zip
+*.onnx
+
+# Data captures / datasets (optional, remove if you want to track enrollment data)
+# data/enroll/
