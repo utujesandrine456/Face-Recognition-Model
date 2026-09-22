@@ -14,7 +14,6 @@ __pycache__/
 
 # IDE and Editor files
 .history/
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -25,3 +24,6 @@ buffalo_l.zip
 
 # Data captures / datasets (optional, remove if you want to track enrollment data)
 # data/enroll/
+
+# Local helper / temp scripts
+
