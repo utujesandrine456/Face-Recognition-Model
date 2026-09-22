@@ -15,6 +15,7 @@ Controls:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import time
 from dataclasses import dataclass
@@ -118,6 +119,10 @@ def draw_status(
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Enroll a person into the face DB")
+    parser.add_argument("--cam", type=int, default=1, help="OpenCV camera index (use embedded USB cam)")
+    args = parser.parse_args()
+
     cfg = EnrollConfig()
     ensure_dirs(cfg)
 
@@ -126,7 +131,7 @@ def main():
         print("No name provided. Exiting.")
         return
 
-    det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=False)
+    det = Haar5ptDetector(min_size=(60, 60), smooth_alpha=0.80, debug=False)
     emb = ArcFaceEmbedderONNX(model_path="models/embedder_arcface.onnx", input_size=(112, 112), debug=False)
 
     db = load_db(cfg)
@@ -145,18 +150,21 @@ def main():
     auto = False
     last_auto = 0.0
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(args.cam, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        raise RuntimeError("Failed to open camera.")
+        raise RuntimeError(f"Failed to open camera index {args.cam}.")
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     cv2.namedWindow(cfg.window_main, cv2.WINDOW_NORMAL)
     cv2.namedWindow(cfg.window_aligned, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(cfg.window_aligned, 240, 240)
 
-    print("\nEnrollment started.")
+    print(f"\nEnrollment started on cam={args.cam}.")
     if base_samples:
         print(f"Re-enroll mode: found {len(base_samples)} existing samples in {person_dir}/")
-    print("Tip: stable lighting, move slightly left/right, different expressions.")
+    print("Tip: stable lighting, face the embedded camera, move slightly left/right.")
     print("Controls: SPACE=capture, a=auto, s=save, r=reset NEW, q=quit\n")
 
     t0 = time.time()

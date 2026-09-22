@@ -18,4 +18,18 @@ See the accompanying book for full explanations. Quick start:
 10. python -m src.enroll           (enroll people)
 11. python -m src.evaluate         (tune threshold)
 12. python -m src.recognize        (live recognition)
-"# Face-Recognition-Model" 
+
+## Embedded (ESP8266 servo pan over MQTT)
+
+Hardware firmware lives in `firmware/esp8266_servo_pan/`.
+
+1. Wire servo signal to D1 (GPIO5). Power servo from external 5V. Common GND with ESP8266.
+2. Flash the sketch from Arduino IDE (PubSubClient + ESP8266 Servo).
+3. Open Serial Monitor at 115200: WiFi + MQTT should connect; servo self-test runs.
+4. On the PC (venv active):
+   - `pip install -r requirements.txt`
+   - `python -m src.servo_test`  (moves servo center/left/right without camera)
+   - `python -m src.recognize`   (tracks face X and publishes pan angles)
+5. Keys in recognize: `m` MQTT on/off, `i` invert pan if the servo turns the wrong way.
+
+MQTT: `broker.benax.rw:1883` topic `face-recognition/servo/pan` (payload = angle int). 

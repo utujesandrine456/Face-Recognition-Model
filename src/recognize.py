@@ -5,14 +5,20 @@ Haar (multi-face) -> FaceMesh 5pt (per-face ROI) -> align_face_5pt (112x112)
 -> ArcFace ONNX embedding -> cosine distance to DB -> label each face.
 
 Run: python -m src.recognize
+     python -m src.recognize --cam 1   # use USB / embedded camera (not laptop)
+
 Keys:
   q : quit
   r : reload DB from disk (data/db/face_db.npz)
   +/- : adjust threshold (distance) live
   d : toggle debug overlay
+  i : invert pan mapping (if servo turns the wrong way)
+  m : toggle MQTT pan publish on/off
+  s : toggle search-when-lost on/off
 """
 from __future__ import annotations
 
+import argparse
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +35,7 @@ except Exception as e:
 
 from .haar_5pt import align_face_5pt
 from .embed import ArcFaceEmbedderONNX
+from .mqtt_servo import ServoPanPublisher, PanController
 
 
 @dataclass
@@ -88,6 +95,12 @@ def _bbox_from_5pt(
     return np.array([x1, y1, x2, y2], dtype=np.float32)
 
 
+def _ema(prev: Optional[np.ndarray], cur: np.ndarray, alpha: float) -> np.ndarray:
+    if prev is None:
+        return cur.astype(np.float32)
+    return (alpha * prev + (1.0 - alpha) * cur).astype(np.float32)
+
+
 def _kps_span_ok(kps: np.ndarray, min_eye_dist: float) -> bool:
     k = kps.astype(np.float32)
     le, re, no, lm, rm = k
@@ -113,11 +126,15 @@ class HaarFaceMesh5pt:
     def __init__(
         self,
         haar_xml: Optional[str] = None,
-        min_size: Tuple[int, int] = (70, 70),
+        min_size: Tuple[int, int] = (60, 60),
+        smooth_alpha: float = 0.75,
         debug: bool = False,
     ):
         self.debug = bool(debug)
         self.min_size = tuple(map(int, min_size))
+        self.smooth_alpha = float(smooth_alpha)
+        self._prev_kps: Optional[np.ndarray] = None
+        self._prev_box: Optional[np.ndarray] = None
 
         if haar_xml is None:
             haar_xml = "models/haarcascade_frontalface_default.xml"
@@ -133,9 +150,9 @@ class HaarFaceMesh5pt:
         self.mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+            refine_landmarks=False,
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4,
         )
 
         self.IDX_LEFT_EYE = 33
@@ -146,17 +163,15 @@ class HaarFaceMesh5pt:
 
     def _haar_faces(self, gray: np.ndarray) -> np.ndarray:
         faces = self.face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, flags=cv2.CASCADE_SCALE_IMAGE, minSize=self.min_size,
+            gray, scaleFactor=1.1, minNeighbors=4, flags=cv2.CASCADE_SCALE_IMAGE, minSize=self.min_size,
         )
         if faces is None or len(faces) == 0:
             return np.zeros((0, 4), dtype=np.int32)
         return faces.astype(np.int32)
 
-    def _roi_facemesh_5pt(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
-        H, W = roi_bgr.shape[:2]
-        if H < 20 or W < 20:
-            return None
-        rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+    def _facemesh_5pt_full(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+        H, W = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         res = self.mesh.process(rgb)
         if not res.multi_face_landmarks:
             return None
@@ -180,38 +195,45 @@ class HaarFaceMesh5pt:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         faces = self._haar_faces(gray)
         if faces.shape[0] == 0:
+            self._prev_kps = None
+            self._prev_box = None
             return []
 
         areas = faces[:, 2] * faces[:, 3]
         order = np.argsort(areas)[::-1]
         faces = faces[order][:max_faces]
 
-        out: List[FaceDet] = []
-        for (x, y, w, h) in faces:
-            mx, my = 0.25 * w, 0.35 * h
-            rx1, ry1, rx2, ry2 = _clip_xyxy(x - mx, y - my, x + w + mx, y + h + my, W, H)
-            roi = frame_bgr[ry1:ry2, rx1:rx2]
+        # Full-frame FaceMesh is much more stable than per-ROI mesh on USB cams.
+        kps = self._facemesh_5pt_full(frame_bgr)
+        if kps is None:
+            return []
 
-            kps_roi = self._roi_facemesh_5pt(roi)
-            if kps_roi is None:
-                if self.debug:
-                    print("[recognize] FaceMesh none for ROI -> skip")
-                continue
+        x, y, w, h = faces[0].tolist()
+        margin = 0.45
+        x1m, y1m = x - margin * w, y - margin * h
+        x2m, y2m = x + (1.0 + margin) * w, y + (1.0 + margin) * h
+        inside = (
+            (kps[:, 0] >= x1m) & (kps[:, 0] <= x2m) &
+            (kps[:, 1] >= y1m) & (kps[:, 1] <= y2m)
+        )
+        if float(inside.mean()) < 0.50:
+            if self.debug:
+                print("[recognize] FaceMesh not consistent with Haar -> skip")
+            return []
 
-            kps = kps_roi.copy()
-            kps[:, 0] += float(rx1)
-            kps[:, 1] += float(ry1)
+        if not _kps_span_ok(kps, min_eye_dist=max(8.0, 0.12 * float(w))):
+            if self.debug:
+                print("[recognize] 5pt geometry failed -> skip")
+            return []
 
-            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * float(w))):
-                if self.debug:
-                    print("[recognize] 5pt geometry failed -> skip")
-                continue
+        bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
+        kps_s = _ema(self._prev_kps, kps, self.smooth_alpha)
+        bb_s = _ema(self._prev_box, bb, self.smooth_alpha)
+        self._prev_kps = kps_s.copy()
+        self._prev_box = bb_s.copy()
 
-            bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
-            x1, y1, x2, y2 = _clip_xyxy(bb[0], bb[1], bb[2], bb[3], W, H)
-
-            out.append(FaceDet(x1=x1, y1=y1, x2=x2, y2=y2, score=1.0, kps=kps.astype(np.float32)))
-        return out
+        x1, y1, x2, y2 = _clip_xyxy(bb_s[0], bb_s[1], bb_s[2], bb_s[3], W, H)
+        return [FaceDet(x1=x1, y1=y1, x2=x2, y2=y2, score=1.0, kps=kps_s.astype(np.float32))]
 
 
 class FaceDBMatcher:
@@ -253,19 +275,61 @@ class FaceDBMatcher:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Live face recognition + MQTT servo pan")
+    parser.add_argument(
+        "--cam",
+        type=int,
+        default=1,
+        help="OpenCV camera index (default 1 = usually USB/embedded; 0 = laptop webcam)",
+    )
+    args = parser.parse_args()
+
     db_path = Path("data/db/face_db.npz")
 
-    det = HaarFaceMesh5pt(min_size=(70, 70), debug=False)
+    det = HaarFaceMesh5pt(min_size=(60, 60), smooth_alpha=0.75, debug=False)
     embedder = ArcFaceEmbedderONNX(model_path="models/embedder_arcface.onnx", input_size=(112, 112), debug=False)
 
     db = load_db_npz(db_path)
-    matcher = FaceDBMatcher(db=db, dist_thresh=0.34)
+    matcher = FaceDBMatcher(db=db, dist_thresh=0.40)
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(args.cam, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        raise RuntimeError("Camera not available")
+        raise RuntimeError(
+            f"Camera index {args.cam} not available. "
+            "Find the right one with: .\\.venv\\Scripts\\python.exe -m src.camera --list"
+        )
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    print("Recognize (multi-face). q=quit, r=reload DB, +/- threshold, d=debug overlay")
+    mqtt_enabled = True
+    search_enabled = True
+    invert_pan = False
+    pan_angle: Optional[int] = 90
+    pan_mode = "idle"
+    pan = PanController(
+        deadzone_frac=0.07,
+        track_gain=22.0,
+        max_step_deg=3.0,
+        lost_before_search_s=0.45,
+        search_step_deg=5.0,
+        search_period_s=0.10,
+    )
+    servo_pub: Optional[ServoPanPublisher] = None
+    locked_label: Optional[str] = None
+    try:
+        servo_pub = ServoPanPublisher(min_publish_interval_s=0.08, min_angle_delta=1)
+        servo_pub.connect()
+        servo_pub.publish_angle(90, force=True)
+    except Exception as e:
+        mqtt_enabled = False
+        print(f"[recognize] MQTT disabled: {e}")
+
+    print(
+        f"Recognize cam={args.cam}. "
+        "q=quit, r=reload, +/- thr, d=debug, m=MQTT, i=invert, s=search"
+    )
+    print("[pan] face -> LOCK. missing ~0.45s -> SEARCH sweep. Watch mode= on screen.")
 
     t0 = time.time()
     frames = 0
@@ -294,11 +358,15 @@ def main():
         y0 = 80
         shown = 0
 
-        for i, f in enumerate(faces):
-            cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
-            for (x, y) in f.kps.astype(int):
-                cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
+        # Prefer a known face for pan locking; else use the first detection.
+        track_face: Optional[FaceDet] = None
+        track_label = "none"
+        first_face: Optional[FaceDet] = None
+        first_label = "none"
+        known_face: Optional[FaceDet] = None
+        known_label = "none"
 
+        for i, f in enumerate(faces):
             aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
             emb = embedder.embed(aligned).embedding
             mr = matcher.match(emb)
@@ -308,6 +376,9 @@ def main():
             line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
 
             color = (0, 255, 0) if mr.accepted else (0, 0, 255)
+            cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, 2)
+            for (x, y) in f.kps.astype(int):
+                cv2.circle(vis, (int(x), int(y)), 2, color, -1)
             cv2.putText(vis, line1, (f.x1, max(0, f.y1 - 28)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             cv2.putText(vis, line2, (f.x1, max(0, f.y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
@@ -321,10 +392,74 @@ def main():
                 dbg = f"kpsLeye=({f.kps[0,0]:.0f},{f.kps[0,1]:.0f})"
                 cv2.putText(vis, dbg, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        header = f"IDs={len(matcher._names)} thr(dist)={matcher.dist_thresh:.2f}"
+            if first_face is None:
+                first_face = f
+                first_label = label
+            if mr.accepted and known_face is None:
+                known_face = f
+                known_label = label
+            # Stick to previously locked identity when possible.
+            if locked_label is not None and label == locked_label:
+                track_face = f
+                track_label = label
+
+        if track_face is None:
+            if known_face is not None:
+                track_face = known_face
+                track_label = known_label
+            elif first_face is not None:
+                track_face = first_face
+                track_label = first_label
+
+        face_cx: Optional[float] = None
+        if track_face is not None:
+            face_cx = 0.5 * (track_face.x1 + track_face.x2)
+            cv2.line(vis, (int(face_cx), 0), (int(face_cx), h), (255, 200, 0), 2)
+            cv2.line(vis, (w // 2, 0), (w // 2, h), (0, 255, 255), 1)
+            dz = int(0.04 * w)
+            cv2.line(vis, (w // 2 - dz, 0), (w // 2 - dz, h), (80, 80, 80), 1)
+            cv2.line(vis, (w // 2 + dz, 0), (w // 2 + dz, h), (80, 80, 80), 1)
+
+        pan.set_invert(invert_pan)
+        prev_angle = int(pan_angle) if pan_angle is not None else None
+        pan_angle, pan_mode = pan.update(face_cx, w, allow_search=search_enabled)
+
+        if pan_mode == "lock" and track_label != "none":
+            locked_label = track_label
+        elif pan_mode in ("search", "idle"):
+            locked_label = None
+
+        if mqtt_enabled and servo_pub is not None:
+            if pan_mode == "search" and pan_angle != prev_angle:
+                # Force each new search step (bypass rate limits).
+                servo_pub.publish_angle(int(pan_angle), force=True)
+            elif pan_mode == "lock" and pan_angle != prev_angle:
+                servo_pub.publish_angle(int(pan_angle), force=False)
+
+        # Big lock / search status
+        if pan_mode == "lock":
+            status = f"LOCKED: {track_label}"
+            status_color = (0, 255, 0)
+        elif pan_mode == "search":
+            status = "SEARCHING..."
+            status_color = (0, 165, 255)
+        elif pan_mode == "hold":
+            status = "HOLD (lost)"
+            status_color = (0, 255, 255)
+        else:
+            status = "IDLE"
+            status_color = (200, 200, 200)
+        cv2.putText(vis, status, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
+
+        header = f"cam={args.cam} IDs={len(matcher._names)} thr(dist)={matcher.dist_thresh:.2f}"
         if fps is not None:
             header += f" fps={fps:.1f}"
-        cv2.putText(vis, header, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+        header += f" pan={pan_angle} mode={pan_mode}"
+        header += f" mqtt={'ON' if mqtt_enabled else 'OFF'}"
+        header += f" search={'ON' if search_enabled else 'OFF'}"
+        if invert_pan:
+            header += " inv"
+        cv2.putText(vis, header, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
         cv2.imshow("recognize_new", vis)
         key = cv2.waitKey(1) & 0xFF
@@ -343,7 +478,19 @@ def main():
         elif key == ord("d"):
             show_debug = not show_debug
             print(f"[recognize] debug overlay: {'ON' if show_debug else 'OFF'}")
+        elif key == ord("m"):
+            mqtt_enabled = not mqtt_enabled
+            print(f"[recognize] MQTT pan: {'ON' if mqtt_enabled else 'OFF'}")
+        elif key == ord("i"):
+            invert_pan = not invert_pan
+            pan.set_invert(invert_pan)
+            print(f"[recognize] pan invert: {'ON' if invert_pan else 'OFF'}")
+        elif key == ord("s"):
+            search_enabled = not search_enabled
+            print(f"[recognize] search-when-lost: {'ON' if search_enabled else 'OFF'}")
 
+    if servo_pub is not None:
+        servo_pub.close()
     cap.release()
     cv2.destroyAllWindows()
 
