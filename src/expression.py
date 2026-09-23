@@ -6,6 +6,7 @@ Lightweight expression cues from MediaPipe FaceMesh landmarks:
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
@@ -25,6 +26,11 @@ L_EYE_OUTER, R_EYE_OUTER = 33, 263
 _open_ear_ema: Optional[float] = None
 _eyes_closed_latched: bool = False
 
+# Blink tracking: open -> closed -> open within a short window
+_blink_was_closed: bool = False
+_blink_closed_t: float = 0.0
+_blink_count: int = 0
+
 
 @dataclass
 class ExpressionState:
@@ -34,11 +40,49 @@ class ExpressionState:
     eye_openness: float  # EAR
     smile_score: float
     label: str
+    blinked: bool = False  # True on the frame a blink completes
+    blink_count: int = 0
 
     def as_log(self) -> str:
         eye = "eyes CLOSED" if self.eyes_closed else "eyes OPEN"
         smile = "SMILING" if self.smiling else "not smiling"
-        return f"{smile}, {eye}"
+        parts = [smile, eye]
+        if self.blinked:
+            parts.append("BLINK")
+        return ", ".join(parts)
+
+
+@dataclass
+class FaceSideState:
+    side: str  # "LEFT" | "CENTER" | "RIGHT"
+    offset: float  # -0.5 .. +0.5 (negative = left of frame center)
+    label: str
+
+    def as_log(self) -> str:
+        return f"on the {self.side}"
+
+
+def face_horizontal_side(
+    face_cx: float,
+    frame_width: int,
+    center_frac: float = 0.12,
+) -> FaceSideState:
+    """
+    Classify face center X as LEFT / CENTER / RIGHT in the frame.
+    center_frac is the deadzone around mid-frame treated as CENTER.
+    """
+    if frame_width <= 1:
+        return FaceSideState(side="CENTER", offset=0.0, label="CENTER")
+    t = float(face_cx) / float(frame_width)
+    t = max(0.0, min(1.0, t))
+    offset = t - 0.5
+    if abs(offset) <= float(center_frac):
+        side = "CENTER"
+    elif offset < 0:
+        side = "LEFT"
+    else:
+        side = "RIGHT"
+    return FaceSideState(side=side, offset=float(offset), label=side)
 
 
 def _xy(lm: Sequence[Any], idx: int, w: float, h: float) -> np.ndarray:
@@ -59,8 +103,34 @@ def _eye_ear(lm: Sequence[Any], idxs: Sequence[int], w: float, h: float) -> floa
 
 def reset_eye_baseline() -> None:
     global _open_ear_ema, _eyes_closed_latched
+    global _blink_was_closed, _blink_closed_t, _blink_count
     _open_ear_ema = None
     _eyes_closed_latched = False
+    _blink_was_closed = False
+    _blink_closed_t = 0.0
+    _blink_count = 0
+
+
+def _update_blink(eyes_closed: bool, now: float, min_s: float = 0.06, max_s: float = 0.55) -> bool:
+    """
+    Detect a blink as eyes going closed then open again within [min_s, max_s].
+    Returns True on the reopen frame when a blink is counted.
+    """
+    global _blink_was_closed, _blink_closed_t, _blink_count
+
+    blinked = False
+    if eyes_closed:
+        if not _blink_was_closed:
+            _blink_closed_t = now
+        _blink_was_closed = True
+    else:
+        if _blink_was_closed:
+            closed_for = now - _blink_closed_t
+            if min_s <= closed_for <= max_s:
+                _blink_count += 1
+                blinked = True
+        _blink_was_closed = False
+    return blinked
 
 
 def analyze_facemesh_expression(
@@ -68,12 +138,14 @@ def analyze_facemesh_expression(
     frame_w: int,
     frame_h: int,
     smile_thresh: float = 0.42,
+    now: Optional[float] = None,
 ) -> ExpressionState:
     """
     landmarks: mediapipe face_mesh landmark list (normalized x,y).
     """
     global _open_ear_ema, _eyes_closed_latched
 
+    now_t = float(now) if now is not None else time.time()
     w, h = float(frame_w), float(frame_h)
 
     left_ear = _eye_ear(landmarks, LEFT_EYE, w, h)
@@ -96,6 +168,8 @@ def analyze_facemesh_expression(
         eyes_closed = ear < close_thresh
     _eyes_closed_latched = bool(eyes_closed)
     eyes_open = not eyes_closed
+
+    blinked = _update_blink(eyes_closed, now_t)
 
     # Smile: wide mouth relative to eye span + corners raised vs lip center
     ml = _xy(landmarks, MOUTH_LEFT, w, h)
@@ -120,6 +194,8 @@ def analyze_facemesh_expression(
         "SMILING" if smiling else "not smiling",
         "eyes CLOSED" if eyes_closed else "eyes OPEN",
     ]
+    if blinked:
+        parts.append("BLINK")
     label = " | ".join(parts)
 
     return ExpressionState(
@@ -129,6 +205,8 @@ def analyze_facemesh_expression(
         eye_openness=float(ear),
         smile_score=float(smile_score),
         label=label,
+        blinked=bool(blinked),
+        blink_count=int(_blink_count),
     )
 
 

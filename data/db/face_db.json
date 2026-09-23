@@ -1,12 +1,12 @@
 {
-  "updated_at": "2026-09-11 09:35:18",
+  "updated_at": "2026-09-23 09:58:35",
   "embedding_dim": 512,
   "names": [
     "Blessed",
-    "Winner"
+    "Utuje"
   ],
   "samples_existing_used": 18,
   "samples_new_used": 34,
   "samples_total_used": 52,
-  "note": "Embeddings are L2-normalized vectors. Matching uses cosine similarity."
+  "note": "Renamed Winner -> Utuje. Embeddings are L2-normalized vectors. Matching uses cosine similarity."
 }

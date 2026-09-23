@@ -27,3 +27,5 @@ buffalo_l.zip
 
 # Local helper / temp scripts
 
+config.bat
+node_modules

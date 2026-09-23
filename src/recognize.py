@@ -36,7 +36,7 @@ except Exception as e:
 from .haar_5pt import align_face_5pt
 from .embed import ArcFaceEmbedderONNX
 from .mqtt_servo import ServoPanPublisher, PanController
-from .expression import ExpressionState, analyze_optional
+from .expression import ExpressionState, FaceSideState, analyze_optional, face_horizontal_side
 
 
 @dataclass
@@ -333,6 +333,7 @@ def main():
     sticky_until = 0.0
     sticky_hold_s = 0.7
     last_expr_log: Optional[str] = None
+    last_side_log: Optional[str] = None
     try:
         servo_pub = ServoPanPublisher(min_publish_interval_s=0.08, min_angle_delta=1)
         servo_pub.connect()
@@ -412,16 +413,40 @@ def main():
             cv2.putText(vis, line2, (f.x1, max(0, f.y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             if f.expression is not None:
-                expr_txt = f.expression.label
+                face_mid_x = 0.5 * (f.x1 + f.x2)
+                side = face_horizontal_side(face_mid_x, w, center_frac=0.12)
+                expr_txt = f"{f.expression.label} | {side.label}"
                 cv2.putText(
                     vis, expr_txt, (f.x1, min(h - 10, f.y2 + 22)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
                 )
                 log_key = f"{label}|{expr_txt}"
                 if log_key != last_expr_log:
                     last_expr_log = log_key
-                    print(f"[expression] {label}: {f.expression.as_log()} "
-                          f"(smile={f.expression.smile_score:.2f}, ear={f.expression.eye_openness:.2f})")
+                    print(
+                        f"[expression] {label}: {f.expression.as_log()}, {side.as_log()} "
+                        f"(smile={f.expression.smile_score:.2f}, ear={f.expression.eye_openness:.2f}, "
+                        f"offset={side.offset:+.2f})"
+                    )
+                if f.expression.blinked:
+                    print(f"[blink] {label}: BLINK detected (count={f.expression.blink_count})")
+                    cv2.putText(
+                        vis, "BLINK!", (f.x1, min(h - 10, f.y2 + 44)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2,
+                    )
+                if side.side != last_side_log:
+                    last_side_log = side.side
+                    print(f"[position] {label}: {side.as_log()}")
+            else:
+                face_mid_x = 0.5 * (f.x1 + f.x2)
+                side = face_horizontal_side(face_mid_x, w, center_frac=0.12)
+                cv2.putText(
+                    vis, f"side: {side.label}", (f.x1, min(h - 10, f.y2 + 22)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+                )
+                if side.side != last_side_log:
+                    last_side_log = side.side
+                    print(f"[position] {label}: {side.as_log()}")
 
             if y0 + thumb <= h and shown < 4:
                 vis[y0:y0 + thumb, x0:x0 + thumb] = aligned
