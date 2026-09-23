@@ -36,6 +36,7 @@ except Exception as e:
 from .haar_5pt import align_face_5pt
 from .embed import ArcFaceEmbedderONNX
 from .mqtt_servo import ServoPanPublisher, PanController
+from .expression import ExpressionState, analyze_optional
 
 
 @dataclass
@@ -46,6 +47,7 @@ class FaceDet:
     y2: int
     score: float
     kps: np.ndarray  # (5,2) float32 in FULL-frame coords
+    expression: Optional[ExpressionState] = None
 
 
 @dataclass
@@ -105,7 +107,8 @@ def _kps_span_ok(kps: np.ndarray, min_eye_dist: float) -> bool:
     k = kps.astype(np.float32)
     le, re, no, lm, rm = k
     eye_dist = float(np.linalg.norm(re - le))
-    if eye_dist < float(min_eye_dist):
+    # Softer eye-span check so closed-eye frames are not rejected as often.
+    if eye_dist < float(min_eye_dist) * 0.75:
         return False
     if not (lm[1] > no[1] and rm[1] > no[1]):
         return False
@@ -169,12 +172,12 @@ class HaarFaceMesh5pt:
             return np.zeros((0, 4), dtype=np.int32)
         return faces.astype(np.int32)
 
-    def _facemesh_5pt_full(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+    def _facemesh_5pt_full(self, frame_bgr: np.ndarray):
         H, W = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         res = self.mesh.process(rgb)
         if not res.multi_face_landmarks:
-            return None
+            return None, None
 
         lm = res.multi_face_landmarks[0].landmark
         idxs = [self.IDX_LEFT_EYE, self.IDX_RIGHT_EYE, self.IDX_NOSE_TIP, self.IDX_MOUTH_LEFT, self.IDX_MOUTH_RIGHT]
@@ -188,7 +191,9 @@ class HaarFaceMesh5pt:
             kps[[0, 1]] = kps[[1, 0]]
         if kps[3, 0] > kps[4, 0]:
             kps[[3, 4]] = kps[[4, 3]]
-        return kps
+
+        expr = analyze_optional(lm, W, H)
+        return kps, expr
 
     def detect(self, frame_bgr: np.ndarray, max_faces: int = 5) -> List[FaceDet]:
         H, W = frame_bgr.shape[:2]
@@ -204,7 +209,7 @@ class HaarFaceMesh5pt:
         faces = faces[order][:max_faces]
 
         # Full-frame FaceMesh is much more stable than per-ROI mesh on USB cams.
-        kps = self._facemesh_5pt_full(frame_bgr)
+        kps, expr = self._facemesh_5pt_full(frame_bgr)
         if kps is None:
             return []
 
@@ -233,11 +238,16 @@ class HaarFaceMesh5pt:
         self._prev_box = bb_s.copy()
 
         x1, y1, x2, y2 = _clip_xyxy(bb_s[0], bb_s[1], bb_s[2], bb_s[3], W, H)
-        return [FaceDet(x1=x1, y1=y1, x2=x2, y2=y2, score=1.0, kps=kps_s.astype(np.float32))]
+        return [
+            FaceDet(
+                x1=x1, y1=y1, x2=x2, y2=y2, score=1.0,
+                kps=kps_s.astype(np.float32), expression=expr,
+            )
+        ]
 
 
 class FaceDBMatcher:
-    def __init__(self, db: Dict[str, np.ndarray], dist_thresh: float = 0.34):
+    def __init__(self, db: Dict[str, np.ndarray], dist_thresh: float = 0.45):
         self.db = db
         self.dist_thresh = float(dist_thresh)
         self._names: List[str] = []
@@ -290,7 +300,8 @@ def main():
     embedder = ArcFaceEmbedderONNX(model_path="models/embedder_arcface.onnx", input_size=(112, 112), debug=False)
 
     db = load_db_npz(db_path)
-    matcher = FaceDBMatcher(db=db, dist_thresh=0.40)
+    # Slightly looser threshold helps smile / blink variation after diverse enrollment.
+    matcher = FaceDBMatcher(db=db, dist_thresh=0.45)
 
     cap = cv2.VideoCapture(args.cam, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -317,6 +328,11 @@ def main():
     )
     servo_pub: Optional[ServoPanPublisher] = None
     locked_label: Optional[str] = None
+    # Hold last accepted identity briefly through blinks / expression changes.
+    sticky_name: Optional[str] = None
+    sticky_until = 0.0
+    sticky_hold_s = 0.7
+    last_expr_log: Optional[str] = None
     try:
         servo_pub = ServoPanPublisher(min_publish_interval_s=0.08, min_angle_delta=1)
         servo_pub.connect()
@@ -371,16 +387,41 @@ def main():
             emb = embedder.embed(aligned).embedding
             mr = matcher.match(emb)
 
-            label = mr.name if mr.name is not None else "Unknown"
+            now_t = time.time()
+            if mr.accepted and mr.name is not None:
+                sticky_name = mr.name
+                sticky_until = now_t + sticky_hold_s
+                label = mr.name
+                accepted = True
+            elif sticky_name is not None and now_t < sticky_until:
+                # Keep identity through blink / short expression change.
+                label = sticky_name
+                accepted = True
+            else:
+                label = mr.name if mr.name is not None else "Unknown"
+                accepted = bool(mr.accepted)
+
             line1 = f"{label}"
             line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
 
-            color = (0, 255, 0) if mr.accepted else (0, 0, 255)
+            color = (0, 255, 0) if accepted else (0, 0, 255)
             cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, 2)
             for (x, y) in f.kps.astype(int):
                 cv2.circle(vis, (int(x), int(y)), 2, color, -1)
             cv2.putText(vis, line1, (f.x1, max(0, f.y1 - 28)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             cv2.putText(vis, line2, (f.x1, max(0, f.y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            if f.expression is not None:
+                expr_txt = f.expression.label
+                cv2.putText(
+                    vis, expr_txt, (f.x1, min(h - 10, f.y2 + 22)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+                )
+                log_key = f"{label}|{expr_txt}"
+                if log_key != last_expr_log:
+                    last_expr_log = log_key
+                    print(f"[expression] {label}: {f.expression.as_log()} "
+                          f"(smile={f.expression.smile_score:.2f}, ear={f.expression.eye_openness:.2f})")
 
             if y0 + thumb <= h and shown < 4:
                 vis[y0:y0 + thumb, x0:x0 + thumb] = aligned
@@ -395,7 +436,7 @@ def main():
             if first_face is None:
                 first_face = f
                 first_label = label
-            if mr.accepted and known_face is None:
+            if accepted and known_face is None:
                 known_face = f
                 known_label = label
             # Stick to previously locked identity when possible.

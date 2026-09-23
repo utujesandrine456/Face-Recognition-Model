@@ -35,11 +35,28 @@ class EnrollConfig:
     out_db_json: Path = Path("data/db/face_db.json")
     save_crops: bool = True
     crops_dir: Path = Path("data/enroll")
-    samples_needed: int = 15
-    auto_capture_every_s: float = 0.25
+    samples_needed: int = 24  # more samples => better smile / blink robustness
+    auto_capture_every_s: float = 0.35
     max_existing_crops: int = 300
     window_main: str = "enroll"
     window_aligned: str = "aligned_112"
+    # Guided expression prompts (cycled while capturing)
+    expression_prompts: tuple = (
+        "NEUTRAL face (relax)",
+        "SMILE naturally",
+        "Eyes OPEN look at camera",
+        "Eyes CLOSED (briefly)",
+        "SMILE + slight LEFT turn",
+        "SMILE + slight RIGHT turn",
+        "Eyes OPEN + slight UP/DOWN",
+    )
+
+
+def current_expression_prompt(cfg: EnrollConfig, new_count: int) -> str:
+    prompts = cfg.expression_prompts
+    if not prompts:
+        return "Look at the camera"
+    return prompts[int(new_count) % len(prompts)]
 
 
 def ensure_dirs(cfg: EnrollConfig) -> None:
@@ -99,22 +116,25 @@ def load_existing_samples_from_crops(
 
 def draw_status(
     frame: np.ndarray, name: str, base_count: int, new_count: int,
-    needed: int, auto: bool, msg: str = "",
+    needed: int, auto: bool, msg: str = "", expression: str = "",
 ) -> None:
     total = base_count + new_count
     lines = [
         f"ENROLL: {name}",
         f"Existing: {base_count} | New: {new_count} | Total: {total} / {needed}",
+        f"NOW DO: {expression}" if expression else "",
         f"Auto: {'ON' if auto else 'OFF'} (toggle: a)",
         "SPACE=capture | s=save | r=reset NEW | q=quit",
     ]
     if msg:
         lines.insert(0, msg)
+    lines = [ln for ln in lines if ln]
 
     y = 30
     for line in lines:
+        color = (0, 255, 255) if line.startswith("NOW DO:") else (255, 255, 255)
         cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2, cv2.LINE_AA)
         y += 26
 
 
@@ -164,7 +184,9 @@ def main():
     print(f"\nEnrollment started on cam={args.cam}.")
     if base_samples:
         print(f"Re-enroll mode: found {len(base_samples)} existing samples in {person_dir}/")
-    print("Tip: stable lighting, face the embedded camera, move slightly left/right.")
+    print("Expression training: follow the yellow 'NOW DO:' prompts.")
+    print("  Include: neutral, smile, eyes open, eyes closed, slight left/right.")
+    print("Tip: press 'a' for auto-capture, then change expression when prompted.")
     print("Controls: SPACE=capture, a=auto, s=save, r=reset NEW, q=quit\n")
 
     t0 = time.time()
@@ -214,6 +236,7 @@ def main():
             draw_status(
                 vis, name=name, base_count=len(base_samples), new_count=len(new_samples),
                 needed=cfg.samples_needed, auto=auto, msg=status_msg,
+                expression=current_expression_prompt(cfg, len(new_samples)),
             )
 
             cv2.imshow(cfg.window_main, vis)
